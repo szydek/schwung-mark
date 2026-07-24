@@ -48,6 +48,13 @@ Distribution repo: github.com/timncox/schwung-mark.
   overtake modules): speakers active + no line-in = auto-mute monitor.
 - Deploys only load at FULL exit (Shift+Vol+Jog from inside) + relaunch;
   Back+re-enter resumes the in-memory session with old code.
+- MIDI CC control (`mark_handle_cc`): external CCs (source EXTERNAL or
+  FX_BROADCAST only — internal would fight Move's encoder CCs) route
+  through `mark_set_param`, so CC edits share trig_active/io_busy/edit_rev
+  semantics with the UI. Identical CC within 256 samples is dropped
+  (chain slots deliver one external CC twice: channel dispatch + FX
+  broadcast — verified in schwung shadow_midi.c 2026-07-24). Map in
+  README; overtake delivery is channel-blind and exactly-once.
 
 ## Engine model
 
