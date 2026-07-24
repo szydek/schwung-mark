@@ -906,6 +906,62 @@ static void test_trim_session_roundtrip(void) {
     printf("ok: trim survives session round-trip\n");
 }
 
+static void test_cc_control(void) {
+    mark_t *m = mark_create(&host);
+    g_in_frame = 0;
+
+    /* continuous scaling: full CC = fader top (200) */
+    uint8_t cc[3] = { 0xB0, 21, 127 };                 /* t2 level */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t2_level") == 200);
+
+    /* identical message inside the guard window is dropped (chain double
+     * delivery), and passes again once audio advances */
+    mark_set_param(m, "t2_level", "88");
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_FX_BROADCAST);
+    assert(gp_int(m, "t2_level") == 88);
+    run(m, 512, 0, NULL);
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t2_level") == 200);
+
+    /* internal MIDI never drives CC control */
+    cc[1] = 30; cc[2] = 0;                             /* would hard-pan t1 */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_INTERNAL);
+    assert(gp_int(m, "t1_pan") == 50);
+
+    /* CC 64 lands on pan center */
+    cc[2] = 64;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t1_pan") == 50);
+
+    /* trigger fires on press, release is a no-op */
+    cc[1] = 50; cc[2] = 127;                           /* t1 btn -> record */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(tstate(m, 0) == MK_REC);
+    cc[2] = 0;                                         /* release */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(tstate(m, 0) == MK_REC);
+
+    /* toggle follows the value */
+    cc[1] = 82; cc[2] = 127;                           /* t3 reverse on */
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t3_rev") == 1);
+    cc[2] = 0;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "t3_rev") == 0);
+
+    /* master + global toggle */
+    cc[1] = 25; cc[2] = 64;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "master") == 101);
+    cc[1] = 103; cc[2] = 127;
+    mark_on_midi(m, cc, 3, MOVE_MIDI_SOURCE_EXTERNAL);
+    assert(gp_int(m, "dub_mode") == 1);
+
+    mark_destroy(m);
+    printf("ok: midi cc control\n");
+}
+
 int main(void) {
     test_record_quantize();
     test_second_track_aligned();
@@ -925,6 +981,7 @@ int main(void) {
     test_grid_and_trim();
     test_trim_session_roundtrip();
     test_len16_and_16th_grid();
+    test_cc_control();
     printf("all mark sim tests passed\n");
     return 0;
 }

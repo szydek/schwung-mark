@@ -180,6 +180,10 @@ struct mark {
     int      measure_flag;       /* set on tick_total % 96 == 0, consumed
                                     by the pending scheduler */
 
+    /* MIDI CC control */
+    uint8_t  cc_last[3];         /* last external CC accepted (dup guard) */
+    uint64_t cc_last_frames;     /* global_frames when it was accepted */
+
     /* Grid: frames per measure captured when the first track finalized.
      * Used for quantization while free-running; a running clock always
      * wins. Reset when every track is cleared. */
@@ -851,8 +855,68 @@ void mark_destroy(mark_t *m) {
 /*  MIDI (clock + transport)                                           */
 /* ------------------------------------------------------------------ */
 
+/* --- MIDI CC control ----------------------------------------------- */
+/* External controllers (USB-A) drive the performance surface, column per
+ * track (Launch Control style). Routed through mark_set_param so CC edits
+ * share every rule with the UI (trig_active, io_busy, edit_rev, RC dub
+ * constraints). See README for the user-facing table.
+ *   20-24 t level   25 master     30-34 t pan    40-44 t fxp
+ *   50-54 t btn     55 all_btn    60-64 t stop   65 undo   70-74 t clear
+ *   80-84 t rev     85-89 t shot  90-94 t fx_on
+ *   102 quantize  103 dub_mode  104 play_mode  105 follow  106 monitor
+ * Continuous 0-127 scales into the param range; buttons act at value>=64
+ * (triggers fire on press, release is a no-op; toggles follow the value). */
+static void cc_track(mark_t *m, int ti, const char *k, const char *val) {
+    char key[16];
+    snprintf(key, sizeof key, "t%d_%s", ti + 1, k);
+    mark_set_param(m, key, val);
+}
+
+static void mark_handle_cc(mark_t *m, int cc, int v) {
+    char val[8];
+    int on = v >= 64;
+    if (cc >= 20 && cc <= 24) {
+        snprintf(val, sizeof val, "%d", (v * 200 + 63) / 127);
+        cc_track(m, cc - 20, "level", val);
+    } else if (cc == 25) {
+        snprintf(val, sizeof val, "%d", (v * 200 + 63) / 127);
+        mark_set_param(m, "master", val);
+    } else if (cc >= 30 && cc <= 34) {
+        snprintf(val, sizeof val, "%d", (v * 100 + 63) / 127);
+        cc_track(m, cc - 30, "pan", val);
+    } else if (cc >= 40 && cc <= 44) {
+        snprintf(val, sizeof val, "%d", (v * 100 + 63) / 127);
+        cc_track(m, cc - 40, "fxp", val);
+    } else if (cc >= 50 && cc <= 54) {
+        if (on) cc_track(m, cc - 50, "btn", "1");
+    } else if (cc == 55) {
+        if (on) mark_set_param(m, "all_btn", "1");
+    } else if (cc >= 60 && cc <= 64) {
+        if (on) cc_track(m, cc - 60, "stop", "1");
+    } else if (cc == 65) {
+        if (on) mark_set_param(m, "undo", "1");
+    } else if (cc >= 70 && cc <= 74) {
+        if (on) cc_track(m, cc - 70, "clear", "1");
+    } else if (cc >= 80 && cc <= 84) {
+        cc_track(m, cc - 80, "rev", on ? "1" : "0");
+    } else if (cc >= 85 && cc <= 89) {
+        cc_track(m, cc - 85, "shot", on ? "1" : "0");
+    } else if (cc >= 90 && cc <= 94) {
+        cc_track(m, cc - 90, "fx_on", on ? "1" : "0");
+    } else if (cc == 102) {
+        mark_set_param(m, "quantize", on ? "1" : "0");
+    } else if (cc == 103) {
+        mark_set_param(m, "dub_mode", on ? "1" : "0");
+    } else if (cc == 104) {
+        mark_set_param(m, "play_mode", on ? "1" : "0");
+    } else if (cc == 105) {
+        mark_set_param(m, "follow", on ? "1" : "0");
+    } else if (cc == 106) {
+        mark_set_param(m, "monitor", on ? "1" : "0");
+    }
+}
+
 void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
-    (void)source;
     if (!m || len < 1) return;
     switch (msg[0]) {
     case 0xFA: /* start */
@@ -883,6 +947,23 @@ void mark_on_midi(mark_t *m, const uint8_t *msg, int len, int source) {
         if (m->tick_total % 96 == 0) m->measure_flag = 1;
         break;
     default: break;
+    }
+    /* External CC control. Internal MIDI (Move's own encoders/buttons)
+     * never acts as CC; a channel-matched chain slot can deliver one
+     * external CC twice (channel dispatch + FX broadcast), so identical
+     * messages within ~2 blocks are dropped. */
+    if (len >= 3 && (msg[0] & 0xF0) == 0xB0 &&
+        (source == MOVE_MIDI_SOURCE_EXTERNAL ||
+         source == MOVE_MIDI_SOURCE_FX_BROADCAST)) {
+        if (!(msg[0] == m->cc_last[0] && msg[1] == m->cc_last[1] &&
+              msg[2] == m->cc_last[2] &&
+              m->global_frames - m->cc_last_frames <= 256)) {
+            m->cc_last[0] = msg[0];
+            m->cc_last[1] = msg[1];
+            m->cc_last[2] = msg[2];
+            m->cc_last_frames = m->global_frames;
+            mark_handle_cc(m, msg[1], msg[2]);
+        }
     }
     /* Hosted effects receive the same clock/transport stream a normal
      * Schwung Chain slot would. UI performance messages can also reach

@@ -65,6 +65,28 @@ Set Move's **MIDI Clock to Out** (Settings → MIDI Sync) to lock loops to
 Move's transport. Without clock, Mark free-runs at the project tempo and
 the first recorded loop anchors the grid.
 
+## MIDI CC control
+
+A controller on the Move's USB-A port (Launch Control XL, Faderfox, etc.)
+drives the whole performance surface, laid out one column per track. Any
+MIDI channel works. Continuous CCs scale 0–127 across the range; buttons
+act at value ≥ 64 — set controller buttons for rec/stop/clear/undo to
+**momentary** and for reverse/one-shot/FX-on to **toggle**.
+
+| CC | function | | CC | function |
+|----|----------|-|----|----------|
+| 20–24 | track 1–5 level (unity ≈ center) | | 65 | undo/redo |
+| 25 | master level | | 70–74 | track 1–5 clear |
+| 30–34 | track 1–5 pan | | 80–84 | track 1–5 reverse |
+| 40–44 | track 1–5 FX amount | | 85–89 | track 1–5 one-shot |
+| 50–54 | track 1–5 rec/play/dub | | 90–94 | track 1–5 FX on/off |
+| 55 | All Start/Stop | | 102–106 | quantize / dub mode / play mode / follow / monitor |
+| 60–64 | track 1–5 stop | | | |
+
+Suggested Launch Control XL layout: faders 1–5 → track levels, fader 8 →
+master, top knob row → pan, middle row → FX amount, button row 1 →
+rec/play/dub, button row 2 → stop.
+
 ## Notes
 
 - Records whatever input Move has selected (mic, line-in, USB-C).
