@@ -37,7 +37,7 @@ import {
     Cyan, Purple, YellowGreen, OrangeRed
 } from '/data/UserData/schwung/shared/constants.mjs';
 
-import { decodeDelta, decodeAcceleratedDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
+import { decodeDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
 
 import {
     drawMenuHeader as drawHeader,
@@ -91,6 +91,7 @@ const CLEAR_HOLD_MS = 600;
 const SAVE_HOLD_MS = 600;
 const FX_EDIT_HOLD_MS = 600;
 const FX_LOAD_DEBOUNCE_MS = 220;
+const TRIGGER_GESTURE_RESET_MS = 700;
 
 /* Knobs 1-8, page 1 */
 const KNOBS = [
@@ -134,6 +135,8 @@ let tfxp     = [50, 50, 50, 50, 50];
 let tfxmod   = ['', '', '', '', ''];
 let tfxstatus = [0, 0, 0, 0, 0];
 let fxParamValues = [{}, {}, {}, {}, {}];
+let fxParamFormats = [{}, {}, {}, {}, {}];
+let fxParamGestures = [{}, {}, {}, {}, {}];
 let undoAvail = 0;      /* 0 none, 1 undo, 2 redo */
 let swapBusy  = 0;
 let quantize  = 1;
@@ -195,9 +198,18 @@ function paramDef(hierarchy, key) {
     return null;
 }
 
-function normalizeFxParam(hierarchy, key) {
-    const raw = paramDef(hierarchy, key) || {};
+function normalizeFxParam(hierarchy, key, inline) {
+    const raw = Object.assign({}, paramDef(hierarchy, key) || {}, inline || {});
     const options = Array.isArray(raw.options) ? raw.options.map(String) : null;
+    const normalized = (options || []).map(v => v.trim().toLowerCase());
+    const behavior = raw.behavior === 'trigger' ||
+        (normalized.includes('idle') && normalized.includes('trigger'))
+        ? 'trigger' : '';
+    let def = Number(raw.default);
+    if (!Number.isFinite(def)) {
+        const named = options ? normalized.indexOf(String(raw.default || '').trim().toLowerCase()) : -1;
+        def = named >= 0 ? named : 0;
+    }
     return {
         key,
         name: String(raw.name || raw.label || key),
@@ -206,8 +218,10 @@ function normalizeFxParam(hierarchy, key) {
         min: raw.min === undefined ? 0 : Number(raw.min),
         max: raw.max === undefined ? (options ? options.length - 1 : 100) : Number(raw.max),
         step: raw.step === undefined ? 1 : Number(raw.step),
-        def: raw.default === undefined ? 0 : Number(raw.default),
-        accel: String(raw.knob_acceleration || '')
+        def,
+        behavior,
+        accel: raw.knob_acceleration === 'wide' || raw.knobAcceleration === 'wide'
+            ? 'wide' : ''
     };
 }
 
@@ -235,8 +249,11 @@ function discoverFxModules() {
         const knobs = root && Array.isArray(root.knobs) ? root.knobs : [];
         const params = [];
         for (let k = 0; k < knobs.length && params.length < 8; k++) {
-            if (typeof knobs[k] === 'string')
+            if (typeof knobs[k] === 'string') {
                 params.push(normalizeFxParam(hierarchy, knobs[k]));
+            } else if (knobs[k] && typeof knobs[k] === 'object' && knobs[k].key) {
+                params.push(normalizeFxParam(hierarchy, knobs[k].key, knobs[k]));
+            }
         }
         fxChoices.push({
             kind: 'module', id,
@@ -274,15 +291,42 @@ function fxChoiceHasEffect(track) {
     return c.kind === 'module' || c.index > 0;
 }
 
+function enumRawUsesIndex(p, raw) {
+    if (!p.options || raw === null || raw === undefined) return true;
+    const text = String(raw).trim();
+    const named = p.options.some(v => v.trim().toLowerCase() === text.toLowerCase());
+    return !named && Number.isFinite(Number(text));
+}
+
+function hostedRawValue(p, raw) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    if (p.options) {
+        const text = String(raw).trim().toLowerCase();
+        const named = p.options.findIndex(v => v.trim().toLowerCase() === text);
+        if (named >= 0) return named;
+    }
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+}
+
+function hostedEnumValue(track, p, index) {
+    const i = Math.max(0, Math.min(p.options.length - 1, Math.round(index)));
+    return fxParamFormats[track][p.key] === false ? p.options[i] : `${i}`;
+}
+
 function refreshHostedParams(track) {
     const choice = currentFxChoice(track);
     if (choice.kind !== 'module' || tfxstatus[track] !== 2) return;
     for (let i = 0; i < choice.params.length; i++) {
         const p = choice.params[i];
         const raw = gp(`t${track + 1}_mod_${p.key}`);
-        if (raw !== null && raw !== '') fxParamValues[track][p.key] = Number(raw);
-        else if (fxParamValues[track][p.key] === undefined)
+        const value = hostedRawValue(p, raw);
+        if (value !== null) {
+            fxParamValues[track][p.key] = value;
+            if (p.options) fxParamFormats[track][p.key] = enumRawUsesIndex(p, raw);
+        } else if (fxParamValues[track][p.key] === undefined) {
             fxParamValues[track][p.key] = p.def;
+        }
     }
 }
 
@@ -370,43 +414,143 @@ function pollStatus() {
     return true;
 }
 
+/* ------------------------------------------------------------ bulk reads
+ *
+ * A single gp() is a BLOCKING round-trip to the shim, serviced once per SPI
+ * frame (~23 ms) and abandoned after 100 ms — schwung's comment above
+ * js_shadow_get_param calls it "the where-does-the-tick-time-go measurement".
+ * The channel serves roughly 44 reads a second in total, and this UI was
+ * asking for 224: a full refresh of fifty-odd keys, three times a second, on
+ * top of a per-tick status poll. Past the ceiling reads simply TIME OUT and
+ * return null, so the UI starves itself and then acts on missing data.
+ *
+ * Overtake modules get BULK_GET — one round-trip for up to 64 keys. Wire
+ * format from shim_handle_param_bulk / bulk_next in schwung's
+ * src/schwung_shim.c: "<count>\n" then records of "<len>\n<bytes>", request
+ * carrying keys and response carrying values in the same order. Falls back to
+ * individual reads on a host without the binding. */
+const BULK_MAX = 48;
+
+function encodeBulk(items) {
+    let out = `${items.length}\n`;
+    for (const it of items) out += `${it.length}\n${it}`;
+    return out;
+}
+
+function decodeBulk(blob, expected) {
+    const out = new Array(expected).fill(null);
+    const s = `${blob}`;
+    let p = 0;
+    const readLen = () => {
+        let n = 0, any = false;
+        while (p < s.length && s[p] >= '0' && s[p] <= '9') {
+            n = n * 10 + (s.charCodeAt(p) - 48); p++; any = true;
+        }
+        if (!any || s[p] !== '\n') return -1;
+        p++;
+        return n;
+    };
+    const count = readLen();
+    if (count < 0) return null;
+    for (let i = 0; i < count && i < expected; i++) {
+        const len = readLen();
+        if (len < 0) return null;
+        out[i] = s.slice(p, p + len);
+        p += len;
+    }
+    return out;
+}
+
+function getParams(keys) {
+    const out = {};
+    if (typeof host_module_get_params !== 'function') {
+        for (const k of keys) out[k] = gp(k);
+        return out;
+    }
+    for (let base = 0; base < keys.length; base += BULK_MAX) {
+        const chunk = keys.slice(base, base + BULK_MAX);
+        const blob = host_module_get_params(encodeBulk(chunk));
+        const vals = (blob === null || blob === undefined)
+            ? null : decodeBulk(blob, chunk.length);
+        if (!vals) { for (const k of chunk) out[k] = gp(k); continue; }
+        for (let i = 0; i < chunk.length; i++) out[chunk[i]] = vals[i];
+    }
+    return out;
+}
+
+/* decodeDelta reports ACCUMULATED encoder movement, so one brisk turn arrives
+ * as a single event carrying 20 or more. Applied raw to a short range that
+ * lands on an end stop every time and makes the values in between unreachable.
+ * Cap the magnitude at a quarter of the range. */
+function scaledSteps(delta, min, max, step) {
+    const span = Math.max(1, Math.round((max - min) / (step || 1)));
+    const cap = Math.max(1, Math.ceil(span / 4));
+    const mag = Math.min(Math.abs(delta), cap);
+    return delta > 0 ? mag : -mag;
+}
+
 function fetchAll() {
     const rs = gp('run_state');
     if (rs === null) return false;       /* DSP not up yet — retry in tick */
-    for (let i = 0; i < KNOBS.length; i++) {
-        if (!KNOBS[i]) continue;
-        const v = gp(KNOBS[i].key);
-        if (v !== null) knobValues[i] = parseFloat(v) || 0;
-    }
-    for (let i = 0; i < KNOBS2.length; i++) {
-        if (!KNOBS2[i]) continue;
-        const v = gp(KNOBS2[i].key);
-        if (v !== null) knob2Values[i] = parseFloat(v) || 0;
-    }
+
+    /* One round-trip for the lot. Read individually this was over fifty
+     * blocking frames, three times a second. */
+    const keys = [];
+    for (const k of KNOBS) if (k) keys.push(k.key);
+    for (const k of KNOBS2) if (k) keys.push(k.key);
+    for (let i = 1; i <= TRACKS; i++)
+        keys.push(`t${i}_rev`, `t${i}_shot`, `t${i}_fx`, `t${i}_fx_on`, `t${i}_fxp`,
+                  `t${i}_fx_module`, `t${i}_fx_status`);
+    keys.push('tmeas', 'quantize', 'rec_grid', 'rec_action', 'dub_mode',
+              'play_mode', 'grid_bpm', 'monitor', 'bpm_override');
+    const v = getParams(keys);
+
+    /* A read that did not come back keeps its previous value. Folding null
+     * into a literal default put that default in the mirror, and the mirror
+     * is written back to the DSP on the next knob turn — a saturated channel
+     * could silently reset the whole surface. */
+    const num = (key, prev) => {
+        const raw = v[key];
+        if (raw === undefined || raw === null || raw === '') return prev;
+        const n = parseFloat(raw);
+        return Number.isFinite(n) ? n : prev;
+    };
+
+    for (let i = 0; i < KNOBS.length; i++)
+        if (KNOBS[i]) knobValues[i] = num(KNOBS[i].key, knobValues[i]);
+    for (let i = 0; i < KNOBS2.length; i++)
+        if (KNOBS2[i]) knob2Values[i] = num(KNOBS2[i].key, knob2Values[i]);
+
     for (let i = 0; i < TRACKS; i++) {
         const oldMod = tfxmod[i], oldStatus = tfxstatus[i];
-        trev[i]  = parseInt(gp(`t${i + 1}_rev`) || '0', 10);
-        tshot[i] = parseInt(gp(`t${i + 1}_shot`) || '0', 10);
-        tfx[i]   = parseInt(gp(`t${i + 1}_fx`) || '1', 10);
-        tfxon[i] = parseInt(gp(`t${i + 1}_fx_on`) || '0', 10);
-        tfxp[i]  = parseInt(gp(`t${i + 1}_fxp`) || '50', 10);
+        trev[i]  = num(`t${i + 1}_rev`, trev[i]);
+        tshot[i] = num(`t${i + 1}_shot`, tshot[i]);
+        tfx[i]   = num(`t${i + 1}_fx`, tfx[i]);
+        tfxon[i] = num(`t${i + 1}_fx_on`, tfxon[i]);
+        tfxp[i]  = num(`t${i + 1}_fxp`, tfxp[i]);
         if (!pendingFxChoice || pendingFxChoice.track !== i) {
-            tfxmod[i] = gp(`t${i + 1}_fx_module`) || '';
-            tfxstatus[i] = parseInt(gp(`t${i + 1}_fx_status`) || '0', 10);
+            const mod = v[`t${i + 1}_fx_module`];
+            if (mod !== null && mod !== undefined) tfxmod[i] = mod;
+            tfxstatus[i] = num(`t${i + 1}_fx_status`, tfxstatus[i]);
         }
-        if (tfxmod[i] !== oldMod) fxParamValues[i] = {};
+        if (tfxmod[i] !== oldMod) {
+            fxParamValues[i] = {};
+            fxParamFormats[i] = {};
+            fxParamGestures[i] = {};
+        }
         if (tfxstatus[i] === 2 && (oldStatus !== 2 || tfxmod[i] !== oldMod))
             refreshHostedParams(i);
     }
-    parseCsv(gp('tmeas'), tmeas);
-    quantize  = parseInt(gp('quantize') || '1', 10);
-    recGrid   = parseInt(gp('rec_grid') || '0', 10);
-    recAction = parseInt(gp('rec_action') || '0', 10);
-    dubMode   = parseInt(gp('dub_mode') || '0', 10);
-    playMode  = parseInt(gp('play_mode') || '0', 10);
-    gridBpm   = parseInt(gp('grid_bpm') || '120', 10);
-    monitorOn = (gp('monitor') || '1') !== '0';
-    bpmOverride = parseFloat(gp('bpm_override')) || 0;
+
+    if (v.tmeas) parseCsv(v.tmeas, tmeas);
+    quantize  = num('quantize', quantize);
+    recGrid   = num('rec_grid', recGrid);
+    recAction = num('rec_action', recAction);
+    dubMode   = num('dub_mode', dubMode);
+    playMode  = num('play_mode', playMode);
+    gridBpm   = num('grid_bpm', gridBpm);
+    monitorOn = num('monitor', monitorOn ? 1 : 0) !== 0;
+    bpmOverride = num('bpm_override', bpmOverride);
     if (sessionMode) fetchSlots();
     pollStatus();
     return true;
@@ -438,7 +582,7 @@ function adjustKnob(bank, i, delta) {
     if (k.isBpm) {
         /* 49 and below = Off (project tempo); 50-200 = override */
         const cur = vals[i] > 0 ? vals[i] : 49;
-        const v = Math.max(49, Math.min(200, Math.round(cur) + delta * k.step));
+        const v = Math.max(49, Math.min(200, Math.round(cur) + scaledSteps(delta, 49, 200, k.step) * k.step));
         const out = v < 50 ? 0 : v;
         vals[i] = out;
         bpmOverride = out;
@@ -450,7 +594,7 @@ function adjustKnob(bank, i, delta) {
     const max = k.opts ? k.opts.length - 1 : k.max;
     const min = k.opts ? 0 : k.min;
     const step = k.opts ? 1 : k.step;
-    const v = Math.max(min, Math.min(max, vals[i] + delta * step));
+    const v = Math.max(min, Math.min(max, vals[i] + scaledSteps(delta, min, max, step) * step));
     if (v === vals[i]) return;
     vals[i] = v;
     host_module_set_param(k.key, `${Math.round(v)}`);
@@ -482,11 +626,78 @@ function adjustFxType(delta) {
         tfxmod[curTrack] = choice.id;
         tfxstatus[curTrack] = 1;
         fxParamValues[curTrack] = {};
+        fxParamFormats[curTrack] = {};
+        fxParamGestures[curTrack] = {};
         pendingFxChoice = { track: curTrack, id: choice.id,
                             at: Date.now() + FX_LOAD_DEBOUNCE_MS };
     }
     announceParameter(`Track ${curTrack + 1} effect`, choice.speech);
     needsRedraw = true;
+}
+
+function hostedGesture(track, key) {
+    if (!fxParamGestures[track][key]) {
+        fxParamGestures[track][key] = {
+            lastTurnMs: 0, direction: 0, triggerLatched: false
+        };
+    }
+    return fxParamGestures[track][key];
+}
+
+function triggerIndices(p) {
+    if (p.behavior !== 'trigger' || !p.options || p.options.length < 2) return null;
+    const normalized = p.options.map(v => v.trim().toLowerCase());
+    const idle = normalized.indexOf('idle');
+    const trigger = normalized.indexOf('trigger');
+    return idle >= 0 && trigger >= 0 ? { idle, trigger } : { idle: 0, trigger: 1 };
+}
+
+function applyHostedTrigger(track, choice, p, delta) {
+    const indices = triggerIndices(p);
+    if (!indices || delta === 0) return false;
+
+    const now = Date.now();
+    const gesture = hostedGesture(track, p.key);
+    if (!gesture.lastTurnMs || now - gesture.lastTurnMs > TRIGGER_GESTURE_RESET_MS)
+        gesture.triggerLatched = false;
+    gesture.lastTurnMs = now;
+    gesture.direction = delta > 0 ? 1 : -1;
+    fxParamValues[track][p.key] = indices.idle;
+
+    let sendIndex = null;
+    if (delta < 0) {
+        gesture.triggerLatched = false;
+        sendIndex = indices.idle;
+    } else if (!gesture.triggerLatched) {
+        gesture.triggerLatched = true;
+        sendIndex = indices.trigger;
+    }
+
+    if (sendIndex !== null) {
+        host_module_set_param(`t${track + 1}_mod_${p.key}`,
+                              hostedEnumValue(track, p, sendIndex));
+        announceParameter(`${choice.name} ${p.name}`, p.options[sendIndex]);
+    }
+    needsRedraw = true;
+    return true;
+}
+
+function accelerateWideDelta(track, p, delta) {
+    if (p.accel !== 'wide' || delta === 0) return delta;
+    const now = Date.now();
+    const direction = delta > 0 ? 1 : -1;
+    const gesture = hostedGesture(track, p.key);
+    const elapsed = gesture.lastTurnMs > 0
+        ? now - gesture.lastTurnMs : Number.POSITIVE_INFINITY;
+    let multiplier = 1;
+    if (direction === gesture.direction) {
+        if (elapsed <= 35) multiplier = 250;
+        else if (elapsed <= 90) multiplier = 50;
+        else if (elapsed <= 180) multiplier = 10;
+    }
+    gesture.lastTurnMs = now;
+    gesture.direction = direction;
+    return delta * multiplier;
 }
 
 function adjustHostedParam(track, index, delta) {
@@ -498,22 +709,24 @@ function adjustHostedParam(track, index, delta) {
                                       : `${choice.name} loading`);
         return;
     }
+    if (applyHostedTrigger(track, choice, p, delta)) return;
     let cur = fxParamValues[track][p.key];
     if (cur === undefined || Number.isNaN(cur)) cur = p.def;
     let next;
-    const trigger = p.options && p.options.some(v => v.toLowerCase() === 'trigger');
-    if (trigger) {
-        next = delta > 0 ? p.options.findIndex(v => v.toLowerCase() === 'trigger') : 0;
-    } else if (p.options) {
+    if (p.options) {
         next = Math.max(0, Math.min(p.options.length - 1,
                                    Math.round(cur) + (delta > 0 ? 1 : -1)));
     } else {
         const step = p.step > 0 ? p.step : 1;
-        next = Math.max(p.min, Math.min(p.max, cur + delta * step));
+        const steps = p.accel === 'wide'
+            ? accelerateWideDelta(track, p, delta)
+            : scaledSteps(delta, p.min, p.max, step);
+        next = Math.max(p.min, Math.min(p.max, cur + steps * step));
     }
-    if (next === cur && !trigger) return;
+    if (next === cur) return;
     fxParamValues[track][p.key] = next;
-    host_module_set_param(`t${track + 1}_mod_${p.key}`, `${next}`);
+    const value = p.options ? hostedEnumValue(track, p, next) : `${next}`;
+    host_module_set_param(`t${track + 1}_mod_${p.key}`, value);
     announceParameter(`${choice.name} ${p.name}`, hostedParamDisplay(track, p));
     needsRedraw = true;
 }
@@ -524,7 +737,7 @@ function adjustFxParam(delta) {
         adjustHostedParam(curTrack, 0, delta);
         return;
     }
-    const v = Math.max(0, Math.min(100, tfxp[curTrack] + delta * 5));
+    const v = Math.max(0, Math.min(100, tfxp[curTrack] + scaledSteps(delta, 0, 100, 5) * 5));
     if (v === tfxp[curTrack]) return;
     tfxp[curTrack] = v;
     host_module_set_param(`t${curTrack + 1}_fxp`, `${v}`);
@@ -822,8 +1035,11 @@ globalThis.tick = function() {
         }
     }
 
-    /* per-tick status poll drives blink, chase and async transitions */
-    pollStatus();
+    /* Every other tick, not every tick. One poll is one blocking read, and at
+     * 44 a second it claimed the whole param channel by itself — which is what
+     * made the editor's own reads time out. Twenty-two updates a second still
+     * reads as continuous motion. */
+    if (tickCount % 2 === 0) pollStatus();
     if (anyPending && tickCount % 4 === 0) paintTracks(false);
     paintSteps(false);
 
@@ -891,13 +1107,7 @@ globalThis.onMidiMessageInternal = function(data) {
         }
         if (d1 >= MoveKnob1 && d1 < MoveKnob1 + 8) {
             const k = d1 - MoveKnob1;
-            let delta = decodeDelta(d2);
-            if (!shiftHeld) {
-                const choice = currentFxChoice(curTrack);
-                const p = choice.kind === 'module'
-                    ? choice.params[fxEdit ? k : (k === 7 ? 0 : -1)] : null;
-                if (p && p.accel) delta = decodeAcceleratedDelta(d2, d1);
-            }
+            const delta = decodeDelta(d2);
             if (delta === 0) return;
             if (!shiftHeld && fxEdit) { adjustHostedParam(curTrack, k, delta); return; }
             if (!shiftHeld && k === 6) { adjustFxType(delta); return; }
